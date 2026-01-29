@@ -88,8 +88,21 @@ export default function Home() {
     setMyDeviceName(deviceName);
 
     // Initialize socket connection only after mount
-    // Use environment variable for server URL or fallback to current origin
-    const serverUrl = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || window.location.origin;
+    // Prefer env var; enforce HTTPS when page is HTTPS to avoid mixed content
+    const envUrl = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL;
+    let serverUrl = envUrl ?? window.location.origin;
+    if (typeof window !== 'undefined') {
+      const isHttpsPage = window.location.protocol === 'https:';
+      const isLocal = serverUrl.includes('localhost') || serverUrl.includes('127.0.0.1');
+      // If running on an HTTPS page and serverUrl is http (and not local), upgrade to https
+      if (isHttpsPage && serverUrl.startsWith('http://') && !isLocal) {
+        serverUrl = serverUrl.replace('http://', 'https://');
+      }
+      // Warn in production if env is missing to avoid connecting to Vercel origin
+      if (!envUrl && process.env.NODE_ENV === 'production') {
+        console.warn('NEXT_PUBLIC_SOCKET_SERVER_URL is not set; falling back to current origin. If deployed on Vercel, set this env to your public Socket.IO server URL.');
+      }
+    }
     const socketInstance = io(serverUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
