@@ -88,7 +88,9 @@ export default function Home() {
     setMyDeviceName(deviceName);
 
     // Initialize socket connection only after mount
-    const socketInstance = io(window.location.origin, {
+    // Use environment variable for server URL or fallback to current origin
+    const serverUrl = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || window.location.origin;
+    const socketInstance = io(serverUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity, // Never stop trying to reconnect
