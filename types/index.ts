@@ -9,6 +9,12 @@ export interface Message {
   senderName: string;
   timestamp: number;
   isSent?: boolean;
+  fileOffer?: {
+    name: string;
+    size: number;
+    type: string;
+    transferId: string;
+  };
 }
 
 export interface FileMetadata {

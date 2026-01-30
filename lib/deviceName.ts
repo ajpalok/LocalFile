@@ -32,5 +32,6 @@ export function getDeviceName(): string {
     return deviceName;
   }
   
-  return generateRandomDeviceName();
+  // During SSR, this shouldn't be called, but return a placeholder just in case
+  return 'Device';
 }

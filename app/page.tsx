@@ -1,47 +1,43 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { io, Socket } from 'socket.io-client';
 import { getDeviceName } from '@/lib/deviceName';
 import { Device } from '@/types';
 import DeviceList from '@/components/DeviceList';
 import ChatInterface from '@/components/ChatInterface';
+import { initFirebase } from '@/lib/firebaseInit';
+import { WebRTCManager } from '@/lib/webrtc';
 
 export default function Home() {
-  const [socket, setSocket] = useState<Socket | null>(null);
+  const [webrtcManager, setWebrtcManager] = useState<WebRTCManager | null>(null);
   const [myDeviceName, setMyDeviceName] = useState<string>('Loading...');
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<Device | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'reconnecting' | 'disconnected'>('connecting');
+  const [deviceId] = useState<string>(() => `device_${Math.random().toString(36).substr(2, 16)}_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`);
   const [isMounted, setIsMounted] = useState(false);
 
   // Prevent browser tab suspension and keep connection alive
   useEffect(() => {
-    let wakeLock: any = null;
-    let antiIdleInterval: NodeJS.Timeout;
+    let wakeLock: WakeLockSentinel | null = null;
+    const antiIdleInterval: NodeJS.Timeout = setInterval(() => {
+      // Minimal DOM operation to keep page "active"
+      const timestamp = Date.now();
+      document.documentElement.setAttribute('data-last-activity', timestamp.toString());
+    }, 30000);
 
     // Request wake lock to prevent tab suspension
     const requestWakeLock = async () => {
       try {
         if ('wakeLock' in navigator) {
-          wakeLock = await (navigator as any).wakeLock.request('screen');
+          wakeLock = await (navigator as Navigator & { wakeLock: { request: (type: string) => Promise<WakeLockSentinel> } }).wakeLock.request('screen');
           console.log('Wake lock acquired - tab will stay active');
         }
-      } catch (err) {
+      } catch {
         console.log('Wake lock not supported or denied');
       }
     };
-
-    // Prevent browser from considering tab idle
-    const preventIdle = () => {
-      // Minimal DOM operation to keep page "active"
-      const timestamp = Date.now();
-      document.documentElement.setAttribute('data-last-activity', timestamp.toString());
-    };
-
-    // Anti-idle mechanism - runs every 30 seconds
-    antiIdleInterval = setInterval(preventIdle, 30000);
 
     // Request wake lock on mount
     requestWakeLock();
@@ -70,10 +66,10 @@ export default function Home() {
     window.addEventListener('unhandledrejection', handleUnhandledRejection);
 
     return () => {
-      clearInterval(antiIdleInterval);
-      if (wakeLock !== null) {
+      if (wakeLock) {
         wakeLock.release();
       }
+      clearInterval(antiIdleInterval);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('error', handleError);
       window.removeEventListener('unhandledrejection', handleUnhandledRejection);
@@ -81,252 +77,56 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    // Set mounted state and initialize device name
     setIsMounted(true);
-    
-    // Initialize device name only after mount to avoid hydration mismatch
-    const deviceName = getDeviceName();
-    setMyDeviceName(deviceName);
+    setMyDeviceName(getDeviceName());
 
-    // Initialize socket connection only after mount
-    // Prefer env var; enforce HTTPS when page is HTTPS to avoid mixed content
-    const envUrl = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL;
-    let serverUrl = envUrl ?? window.location.origin;
-    if (typeof window !== 'undefined') {
-      const isHttpsPage = window.location.protocol === 'https:';
-      const isLocal = serverUrl.includes('localhost') || serverUrl.includes('127.0.0.1');
-      // If running on an HTTPS page and serverUrl is http (and not local), upgrade to https
-      if (isHttpsPage && serverUrl.startsWith('http://') && !isLocal) {
-        serverUrl = serverUrl.replace('http://', 'https://');
-      }
-      // Warn in production if env is missing to avoid connecting to Vercel origin
-      if (!envUrl && process.env.NODE_ENV === 'production') {
-        console.warn('NEXT_PUBLIC_SOCKET_SERVER_URL is not set; falling back to current origin. If deployed on Vercel, set this env to your public Socket.IO server URL.');
-      }
+    // Initialize Firebase and WebRTC
+    try {
+      const { database } = initFirebase();
+      const manager = new WebRTCManager(database, deviceId, getDeviceName());
+
+      // Set up callbacks
+      manager.onDeviceList((deviceList) => {
+        console.log('Device list updated:', deviceList);
+        setDevices(deviceList);
+        setIsConnected(true);
+        setConnectionStatus('connected');
+        
+        // If selected device is no longer in the list, deselect it
+        if (selectedDevice && !deviceList.find((d: Device) => d.id === selectedDevice.id)) {
+          setSelectedDevice(null);
+        }
+      });
+
+      setWebrtcManager(manager); // eslint-disable-line react-hooks/set-state-in-effect
+      console.log('WebRTC Manager initialized');
+    } catch (error) {
+      console.error('Error initializing Firebase/WebRTC:', error);
+      setConnectionStatus('disconnected');
     }
-    const socketInstance = io(serverUrl, {
-      transports: ['websocket', 'polling'],
-      reconnection: true,
-      reconnectionAttempts: Infinity, // Never stop trying to reconnect
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      timeout: 20000
-    });
-
-    socketInstance.on('connect', () => {
-      console.log('Connected to server');
-      setIsConnected(true);
-      socketInstance.emit('register-device', deviceName);
-    });
-
-    socketInstance.on('disconnect', (reason) => {
-      console.log('Disconnected from server:', reason);
-      setIsConnected(false);
-      
-      // Only show disconnection if it's not due to intentional disconnection
-      if (reason === 'io server disconnect' || reason === 'io client disconnect') {
-        console.log('Server initiated disconnect');
-      }
-    });
-
-    socketInstance.on('connect_error', (error) => {
-      console.error('Connection error:', error.message, error);
-      setIsConnected(false);
-    });
-
-    socketInstance.on('connect_timeout', () => {
-      console.error('Connection timeout');
-      setIsConnected(false);
-    });
-
-    socketInstance.on('error', (error) => {
-      console.error('Socket error:', error);
-    });
-
-    socketInstance.on('reconnect', (attemptNumber) => {
-      console.log('Reconnected after', attemptNumber, 'attempts');
-      setIsConnected(true);
-      // Re-register device after reconnection
-      socketInstance.emit('register-device', deviceName);
-    });
-
-    socketInstance.on('reconnect_error', (error) => {
-      console.log('Reconnection failed:', error);
-    });
-
-    socketInstance.on('reconnect_failed', () => {
-      console.log('Failed to reconnect after all attempts');
-      // Don't set disconnected status immediately to prevent page reload
-      setTimeout(() => {
-        if (!socketInstance.connected) {
-          setConnectionStatus('disconnected');
-        }
-      }, 5000); // Wait 5 seconds before marking as disconnected
-    });
-
-    socketInstance.on('heartbeat-response', () => {
-      console.log('Heartbeat response received from server');
-    });
-
-    socketInstance.on('device-list', (deviceList: Device[]) => {
-      console.log('Received device list:', deviceList);
-      console.log('Current socket ID:', socketInstance.id);
-      setDevices(deviceList);
-      
-      // If selected device is no longer in the list, deselect it
-      if (selectedDevice && !deviceList.find(d => d.id === selectedDevice.id)) {
-        setSelectedDevice(null);
-      }
-    });
-
-    setSocket(socketInstance);
 
     return () => {
-      socketInstance.disconnect();
-    };
-  }, []);
-
-  // Connection status management
-  useEffect(() => {
-    if (!socket) return;
-
-    const handleConnect = () => {
-      console.log('Connected to server');
-      setConnectionStatus('connected');
-    };
-
-    const handleDisconnect = () => {
-      console.log('Disconnected from server');
-      setConnectionStatus('disconnected');
-    };
-
-    const handleReconnect = () => {
-      console.log('Reconnected to server');
-      setConnectionStatus('connected');
-    };
-
-    const handleReconnectAttempt = () => {
-      console.log('Attempting to reconnect...');
-      setConnectionStatus('reconnecting');
-    };
-
-    const handleReconnectError = () => {
-      console.log('Reconnection failed');
-      setConnectionStatus('disconnected');
-    };
-
-    const handleReconnectFailed = () => {
-      console.log('Reconnection failed permanently');
-      setConnectionStatus('disconnected');
-    };
-
-    socket.on('connect', handleConnect);
-    socket.on('disconnect', handleDisconnect);
-    socket.on('reconnect', handleReconnect);
-    socket.on('reconnect_attempt', handleReconnectAttempt);
-    socket.on('reconnect_error', handleReconnectError);
-    socket.on('reconnect_failed', handleReconnectFailed);
-
-    return () => {
-      socket.off('connect', handleConnect);
-      socket.off('disconnect', handleDisconnect);
-      socket.off('reconnect', handleReconnect);
-      socket.off('reconnect_attempt', handleReconnectAttempt);
-      socket.off('reconnect_error', handleReconnectError);
-      socket.off('reconnect_failed', handleReconnectFailed);
-    };
-  }, [socket]);
-
-  // Heartbeat mechanism to keep connection alive
-  useEffect(() => {
-    if (!socket) return;
-
-    const heartbeatInterval = setInterval(() => {
-      if (socket.connected) {
-        socket.emit('heartbeat');
-      } else {
-        // Try to reconnect if disconnected
-        if (!socket.active) {
-          console.log('Socket inactive, attempting reconnection');
-          socket.connect();
-        }
-      }
-    }, 50000); // Send heartbeat every 50 seconds
-
-    // Monitor network state changes
-    const handleOnline = () => {
-      console.log('Network online - ensuring connection');
-      if (!socket.connected) {
-        socket.connect();
+      if (webrtcManager) {
+        webrtcManager.destroy();
       }
     };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-    const handleOffline = () => {
-      console.log('Network offline - connection may be affected');
-    };
-
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-
-    return () => {
-      clearInterval(heartbeatInterval);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
-  }, [socket]);
-
-  // Monitor visibility changes and actively maintain connection
-  useEffect(() => {
-    if (!socket) return;
-
-    const handleVisibilityChange = () => {
-      if (!document.hidden) {
-        console.log('Tab became visible');
-        // Immediately send heartbeat when tab becomes active
-        if (socket.connected) {
-          socket.emit('heartbeat');
-        } else {
-          console.log('Socket disconnected while hidden, reconnecting...');
-          socket.connect();
-        }
-      }
-    };
-
-    // Also handle page focus
-    const handleFocus = () => {
-      if (socket && !socket.connected) {
-        console.log('Window focused, reconnecting socket');
-        socket.connect();
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('focus', handleFocus);
-
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('focus', handleFocus);
-    };
-  }, [socket]);
-
-  const handleDeviceSelect = (device: Device) => {
+  const handleDeviceSelect = async (device: Device) => {
     setSelectedDevice(device);
+    // Initiate WebRTC connection when device is selected
+    if (webrtcManager) {
+      // Add a small random delay to help prevent race conditions
+      const delay = Math.random() * 200; // Random delay up to 200ms
+      await new Promise(resolve => setTimeout(resolve, delay));
+      await webrtcManager.connectToPeer(device.id);
+    }
   };
 
   const handleBackToDevices = () => {
     setSelectedDevice(null);
   };
-
-  // Prevent hydration mismatch by not rendering until mounted
-  if (!isMounted) {
-    return (
-      <div className="min-h-screen bg-linear-to-br from-blue-50 to-indigo-100 flex items-center justify-center">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
-          <p className="text-gray-600">Loading...</p>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="min-h-screen bg-linear-to-br from-blue-50 to-indigo-100">
@@ -360,7 +160,9 @@ export default function Home() {
                 </div>
                 <div className="bg-indigo-100 px-3 sm:px-4 py-2 rounded-lg">
                   <p className="text-sm text-gray-600">Your device name</p>
-                  <p className="text-base sm:text-lg font-bold text-indigo-600 truncate">{myDeviceName}</p>
+                  <p className="text-base sm:text-lg font-bold text-indigo-600 truncate">
+                    {isMounted ? myDeviceName : 'Loading...'}
+                  </p>
                 </div>
               </div>
             </div>
@@ -376,7 +178,7 @@ export default function Home() {
               />
             ) : (
               <ChatInterface
-                socket={socket}
+                webrtcManager={webrtcManager}
                 selectedDevice={selectedDevice}
                 myDeviceName={myDeviceName}
                 onBack={handleBackToDevices}
